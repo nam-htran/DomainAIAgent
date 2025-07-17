@@ -1,0 +1,790 @@
+
+===== ./test.py =====
+# test_rag.py
+
+from rag_engine.embedding import get_embedding
+from rag_engine.vector_store import query_vector_store
+from rag_engine.llm import call_llm, count_tokens, suggest_followups
+from rag_engine.reranker import rerank_results
+import os
+
+
+def main():
+    print("=== Domain-AI Copilot (Phase 2) ===")
+    while True:
+        query = input("\n🔍 Nhập câu hỏi của bạn: ")
+        if query.lower() in ["exit", "quit"]:
+            break
+
+        query_embedding = get_embedding(query)
+        top_k_results = query_vector_store(query_embedding, top_k=10)
+
+        # Re-rank các kết quả
+        reranked = rerank_results(query, top_k_results, top_n=5)
+
+        print("\n📄 Top 5 tài liệu được truy xuất (sau khi rerank):")
+        context = ""
+        for i, doc in enumerate(reranked):
+            metadata = doc.payload or {}
+            content = metadata.get("text", "<no content>")
+            score = doc.score
+            source = metadata.get("source", "unknown")
+            chunk_id = metadata.get("chunk_id", "?")
+            print(f"[{i+1}] (Score: {score:.4f}) - {source} [Chunk #{chunk_id}]\n{content}\n")
+            context += content + "\n"
+
+        token_count = count_tokens(context)
+        print(f"🧠 Tổng số tokens dùng làm context: {token_count}")
+
+        final_prompt = f"Trả lời câu hỏi sau dựa vào thông tin sau:\n---\n{context}\n---\nCâu hỏi: {query}"
+        answer = call_llm(final_prompt)
+
+        print("\n🤖 Trả lời:")
+        print(answer)
+
+        suggestions = suggest_followups(answer)
+        print("\n💡 Gợi ý câu hỏi tiếp theo:")
+        for i, sug in enumerate(suggestions, 1):
+            print(f"{i}. {sug}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+===== ./llm_utils.py =====
+# llm_utils.py
+import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv("OPENROUTER_API_KEY")
+
+def call_llm(prompt, model="mistralai/mistral-7b-instruct"):
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.5
+    }
+
+    response = requests.post(url, headers=headers, json=payload)
+    result = response.json()
+    return result["choices"][0]["message"]["content"]
+
+
+===== ./app.py =====
+# app.py - Streamlit UI for Domain-AI Copilot Phase 4
+
+import streamlit as st
+from rag_engine.embedding import get_embedding_cached
+from rag_engine.vector_store import query_vector_store, init_qdrant
+from rag_engine.llm import (
+    call_llm_cached, count_tokens,
+    suggest_followups, build_prompt_with_history,
+    is_editing_previous_query
+)
+from rag_engine.reranker import rerank_with_cohere
+from rag_engine.project_builder import create_project_from_prompt
+from rag_engine.auto_builder import (
+    create_and_run_project_from_prompt,
+    debug_and_fix_project_forever
+)
+
+st.set_page_config(page_title="Domain-AI Copilot")
+st.title("🤖 Domain-AI Copilot – RAG Chatbot")
+
+init_qdrant()
+
+# Sidebar – tạo và chạy dự án AI tự động
+with st.sidebar:
+    st.subheader("🚀 Tạo dự án AI mới")
+    project_prompt = st.text_area("Nhập yêu cầu dự án:", placeholder="VD: Tạo dự án YOLOv8 phát hiện mũ bảo hiểm từ dữ liệu helmet_data/")
+    
+    if st.button("Tạo dự án") and project_prompt:
+        with st.spinner("🔧 Đang tạo dự án từ AI..."):
+            project_path = create_project_from_prompt(project_prompt)
+            st.success(f"✅ Đã tạo dự án tại `{project_path}`")
+
+    if st.button("Tạo & Chạy dự án AI") and project_prompt:
+        with st.spinner("⚙️ Đang xử lý và chạy thử dự án..."):
+            result = create_and_run_project_from_prompt(project_prompt)
+            st.success("✅ Đã chạy xong dự án!")
+            st.code(result, language="bash")
+
+    if st.button("🔧 Debug & Fix Tự động") and project_prompt:
+        with st.spinner("♻️ Đang debug cho đến khi chạy thành công..."):
+            debug_result = debug_and_fix_project_forever(project_prompt)
+            st.success("✅ Debug hoàn tất, mã đã chạy thành công!")
+
+            # 📤 Hiển thị kết quả run
+            if debug_result.get("run_output"):
+                st.subheader("📤 Kết quả chạy `main.py`:")
+                st.code(debug_result["run_output"], language="bash")
+
+            # 📄 Hiển thị các file code đã sinh/fix
+            if debug_result.get("files"):
+                for file_path, code in debug_result["files"].items():
+                    st.subheader(f"📄 {file_path}")
+                    st.code(code, language="python")
+
+# Chat RAG
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+query = st.chat_input("Hỏi tài liệu kỹ thuật...")
+
+if query:
+    previous_turns = st.session_state.chat_history
+    is_edit = is_editing_previous_query(query)
+    full_prompt = build_prompt_with_history(query, previous_turns) if not is_edit else query
+
+    embedded_query = get_embedding_cached(query)
+    docs = query_vector_store(embedded_query, top_k=10)
+    reranked_docs = rerank_with_cohere(query, docs) if docs else []
+
+    context = "\n\n".join([doc["text"] for doc in reranked_docs]) if reranked_docs else ""
+    prompt = f"Dựa vào ngữ cảnh sau, hãy trả lời câu hỏi một cách chính xác và ngắn gọn.\n\nNgữ cảnh:\n{context}\n\nCâu hỏi: {full_prompt}"
+
+    answer = call_llm_cached(prompt)
+    st.session_state.chat_history.append({"query": query, "answer": answer})
+
+# Hiển thị lịch sử chat
+for turn in st.session_state.chat_history:
+    with st.chat_message("user"):
+        st.markdown(turn["query"])
+    with st.chat_message("ai"):
+        st.markdown(turn["answer"])
+
+# Gợi ý câu hỏi tiếp theo
+if st.session_state.chat_history:
+    with st.expander("✨ Gợi ý câu hỏi tiếp theo"):
+        last_answer = st.session_state.chat_history[-1]["answer"]
+        suggestions = suggest_followups(last_answer)
+        for s in suggestions:
+            st.markdown(f"- {s}")
+
+# Trích nguồn tài liệu
+def format_citation(doc, idx):
+    source = doc.get("source", "unknown")
+    chunk_id = doc.get("chunk_id", "?")
+    return f"[{idx+1}] {source} (chunk #{chunk_id})"
+
+if query and reranked_docs:
+    st.caption("📚 Trích nguồn:")
+    for i, doc in enumerate(reranked_docs):
+        st.markdown(f"- {format_citation(doc, i)}")
+
+
+===== ./generated_projects/project_20250717_115520/main.py =====
+import argparse
+import torch
+from ultralytics import YOLO
+from utils.helper import load_config
+
+def train(config):
+    """Train YOLOv8 model on MNIST dataset."""
+    model = YOLO(config['model_name'])
+    model.train(data=config['data'], epochs=config['epochs'], imgsz=config['img_size'])
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config file')
+    args = parser.parse_args()
+    
+    config = load_config(args.config)
+    train(config)
+
+===== ./generated_projects/project_20250717_115520/utils/helper.py =====
+import yaml
+
+def load_config(config_path):
+    """Load YAML config file."""
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    return config
+
+def save_config(config, config_path):
+    """Save YAML config file."""
+    with open(config_path, 'w') as f:
+        yaml.dump(config, f)
+
+===== ./rag_engine/__init__.py =====
+
+
+===== ./rag_engine/file_parser.py =====
+import fitz
+import pandas as pd
+import docx
+import tiktoken
+
+CHUNK_SIZE = 300
+CHUNK_OVERLAP = 50
+
+def parse_pdf(file):
+    doc = fitz.open(stream=file.read(), filetype="pdf")
+    text = ""
+    for page in doc:
+        text += page.get_text()
+    return text
+
+def parse_csv(file):
+    df = pd.read_csv(file)
+    return df.to_string()
+
+def parse_docx(file):
+    doc = docx.Document(file)
+    text = "\n".join([para.text for para in doc.paragraphs])
+    return text
+
+def extract_text(file, file_type):
+    if file_type == "pdf":
+        return parse_pdf(file)
+    elif file_type == "csv":
+        return parse_csv(file)
+    elif file_type == "docx":
+        return parse_docx(file)
+    else:
+        return "Unsupported file type"
+    
+def smart_chunk(text: str, max_tokens=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Chia nhỏ văn bản thành các đoạn thông minh dựa theo ngữ nghĩa, ngắt theo dòng hoặc đoạn."""
+    encoding = tiktoken.get_encoding("cl100k_base")
+    lines = text.splitlines()
+    
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        line_tokens = len(encoding.encode(line))
+        if current_tokens + line_tokens > max_tokens:
+            if current_chunk:
+                chunks.append(" ".join(current_chunk))
+                # tạo phần chồng lặp
+                if overlap > 0 and len(chunks) > 0:
+                    overlap_tokens = 0
+                    overlap_chunk = []
+                    for prev_line in reversed(current_chunk):
+                        tokens = len(encoding.encode(prev_line))
+                        if overlap_tokens + tokens > overlap:
+                            break
+                        overlap_chunk.insert(0, prev_line)
+                        overlap_tokens += tokens
+                    current_chunk = overlap_chunk.copy()
+                    current_tokens = overlap_tokens
+                else:
+                    current_chunk = []
+                    current_tokens = 0
+        current_chunk.append(line)
+        current_tokens += line_tokens
+
+    if current_chunk:
+        chunks.append(" ".join(current_chunk))
+
+    return chunks
+
+===== ./rag_engine/auto_builder.py =====
+import os
+import json
+from datetime import datetime
+from rag_engine.utils import (
+    write_code_files,
+    extract_json_string,
+    read_all_code_files,  # ✅ Đã bổ sung đúng
+)
+from rag_engine.runner import run_project
+from rag_engine.llm import call_llm
+
+
+def get_code_from_prompt(user_prompt: str) -> dict:
+    full_prompt = f"""
+Bạn là một trợ lý AI chuyên viết ứng dụng Python.
+
+Hãy tạo một project Python hoàn chỉnh dựa trên yêu cầu sau:
+"{user_prompt}"
+
+Yêu cầu:
+- Trả về **dưới dạng JSON**, không thêm mô tả nào khác.
+- Mỗi key là tên file (vd: main.py, utils.py)
+- Mỗi value là nội dung file tương ứng.
+
+Ví dụ định dạng JSON hợp lệ:
+{{
+  "main.py": "print('hello')",
+  "utils.py": "def helper(): pass"
+}}
+
+Hãy chắc chắn trả về đúng JSON!
+"""
+
+    response = call_llm(full_prompt)
+    print("===> Raw LLM response:\n", response)
+
+    # Try to extract JSON
+    try:
+        file_dict = extract_json_string(response)
+    except Exception as e:
+        print("[WARNING] Không parse được JSON, fallback tạo main.py")
+        file_dict = {"main.py": response}
+
+    return file_dict
+
+
+def create_project_from_prompt(prompt: str) -> str:
+    response = get_code_from_prompt(prompt)
+
+    try:
+        json_str = extract_json_string(response)
+        files = json.loads(json_str)
+    except Exception as e:
+        raise ValueError(f"Output không đúng JSON:\n{response}") from e
+
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    project_path = os.path.join("generated_projects", f"project_{now}")
+    os.makedirs(project_path, exist_ok=True)
+
+    write_code_files(files, project_path)
+    return project_path
+
+
+def create_and_run_project_from_prompt(prompt: str) -> str:
+    project_path = create_project_from_prompt(prompt)
+    output = run_project(project_path)
+    return output
+
+
+def debug_and_fix_project_forever(prompt: str, max_rounds: int = 5) -> str:
+    project_path = create_project_from_prompt(prompt)
+
+    for round in range(max_rounds):
+        print(f"\n🔁 Debug Round {round + 1}")
+
+        output = run_project(project_path)
+        if "[ERROR]" not in output:
+            print("✅ Chạy thành công")
+            return output
+
+        # Đọc toàn bộ mã hiện tại
+        current_code = read_all_code_files(project_path)
+
+        fix_prompt = f"""
+    Dưới đây là mã nguồn của một project Python và lỗi gặp phải khi chạy. Hãy sửa lỗi và trả về lại tất cả các file dưới dạng JSON.
+
+    ## Code hiện tại:
+    {current_code}
+    ## Lỗi khi chạy:
+    {output}
+    Trả về JSON mới cho toàn bộ các file đã chỉnh sửa.
+    """
+    response = call_llm(fix_prompt)
+
+    try:
+        json_str = extract_json_string(response)
+        new_code_files = json.loads(json_str)
+    except Exception as e:
+        raise ValueError(f"[❌] JSON response không hợp lệ:\n{response}") from e
+
+    write_code_files(new_code_files, project_path)
+
+    return f"[‼️] Đã thử {max_rounds} lần nhưng vẫn lỗi:\n{output}"
+
+===== ./rag_engine/vector_store.py =====
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+from qdrant_client.http.models import PointStruct, SearchParams
+from typing import List, Tuple
+import uuid
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+QDRANT_HOST = os.getenv("QDRANT_HOST")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME")
+
+client = QdrantClient(
+    url=QDRANT_HOST,
+    api_key=QDRANT_API_KEY
+)
+
+def init_qdrant(vector_size=1536):
+    try:
+        client.get_collection(COLLECTION_NAME)
+        print(f"Collection '{COLLECTION_NAME}' already exists.")
+    except Exception:
+        print(f"Creating collection '{COLLECTION_NAME}' with vector size {vector_size}...")
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(
+                size=vector_size,
+                distance=Distance.COSINE
+            )
+        )
+
+def add_embeddings_to_qdrant(texts: List[str], embeddings: List[List[float]]):
+    """
+    Lưu text và embedding tương ứng vào Qdrant
+    """
+    expected_dim = int(os.getenv("EMBEDDING_DIM"))
+    actual_dim = len(embeddings[0])
+    if actual_dim != expected_dim:
+        raise ValueError(f"Mismatch embedding dimension: expected {expected_dim}, got {actual_dim}")
+
+    points = [
+        PointStruct(
+            id=str(uuid.uuid4()),
+            vector=embedding,
+            payload={"text": text},
+        )
+        for text, embedding in zip(texts, embeddings)
+    ]
+    client.upsert(collection_name=COLLECTION_NAME, points=points)
+
+def search_similar(query_embedding: List[float], top_k: int = 3) -> List[Tuple[str, float]]:
+    search_result = client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=query_embedding,
+        limit=top_k,
+        with_payload=True,
+    )
+    results = []
+    for item in search_result:
+        text = item.payload.get("text", "")
+        score = item.score
+        results.append((text, score))
+    return results
+
+def query_vector_store(embedding: list[float], top_k: int = 5):
+    hits = client.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=embedding,
+        limit=top_k,
+        search_params=SearchParams(hnsw_ef=128),
+        with_payload=True,
+        with_vectors=False
+    )
+    return hits
+
+===== ./rag_engine/project_builder.py =====
+# rag_engine/project_builder.py
+
+import os
+import hashlib
+
+from rag_engine.llm import call_llm_cached
+
+def slugify(text):
+    """Tạo tên thư mục ngắn gọn từ prompt"""
+    hash_object = hashlib.md5(text.encode())
+    return hash_object.hexdigest()[:8]
+
+def create_project_from_prompt(prompt: str) -> str:
+    """Tạo project Python từ prompt và lưu vào thư mục mới"""
+    folder_name = slugify(prompt)
+    project_path = os.path.join("generated_projects", folder_name)
+    os.makedirs(project_path, exist_ok=True)
+
+    code_prompt = f"""Viết một file `main.py` thực hiện yêu cầu sau:\n\n{prompt}\n\nHãy trả về toàn bộ nội dung file."""
+    code = call_llm_cached(code_prompt)
+
+    main_path = os.path.join(project_path, "main.py")
+    with open(main_path, "w", encoding="utf-8") as f:
+        f.write(code)
+
+    return project_path
+
+
+===== ./rag_engine/utils.py =====
+import json
+import os
+import re
+
+def extract_json_string(text: str) -> str:
+    """
+    Trích xuất đoạn JSON từ text có thể chứa cả markdown code block.
+    """
+    try:
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].strip()
+        return text
+    except Exception as e:
+        raise ValueError("Không thể trích xuất JSON từ text") from e
+
+def write_code_files(file_dict: dict, base_path: str):
+    """
+    Ghi các file code từ dict JSON xuống thư mục base_path.
+    """
+    os.makedirs(base_path, exist_ok=True)
+    for file_path, code in file_dict.items():
+        full_path = os.path.join(base_path, file_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+def read_all_code_files(base_path: str) -> dict:
+    """
+    Đọc toàn bộ mã nguồn từ thư mục base_path, trả về dict dạng {filepath: code}.
+    """
+    file_dict = {}
+    for root, _, files in os.walk(base_path):
+        for file in files:
+            path = os.path.join(root, file)
+            rel_path = os.path.relpath(path, base_path)
+            with open(path, "r", encoding="utf-8") as f:
+                file_dict[rel_path] = f.read()
+    return file_dict
+
+def extract_json_string(text: str) -> dict:
+    """
+    Tìm đoạn JSON trong text (nếu bị bọc trong markdown ```json ... ``` thì cắt ra)
+    """
+    json_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1)
+    else:
+        json_str = text.strip()
+
+    return json.loads(json_str)
+
+===== ./rag_engine/reranker.py =====
+# rag_engine/reranker.py
+
+import os
+import cohere
+from dotenv import load_dotenv
+
+load_dotenv()
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+
+co = cohere.Client(COHERE_API_KEY)
+
+def rerank_with_cohere(query: str, documents: list[str], top_n: int = 5):
+    response = co.rerank(
+        model="rerank-v3.5",
+        query=query,
+        documents=documents,
+        top_n=top_n,
+    )
+    reranked = [
+        {"text": documents[r.index], "score": r.relevance_score}
+        for r in response.results
+    ]
+    return reranked
+
+
+===== ./rag_engine/llm.py =====
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+import tiktoken
+import re
+import hashlib
+import pickle
+
+load_dotenv()
+
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY"),
+)
+
+CACHE_DIR = ".cache/llm"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek/deepseek-chat-v3-0324:free")
+
+def call_llm(prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": "Bạn là một trợ lý AI hỗ trợ tìm kiếm và trả lời kỹ thuật từ tài liệu."},
+            {"role": "user", "content": prompt}
+        ],
+    )
+    return response.choices[0].message.content
+
+def count_tokens(text: str) -> int:
+    # Dùng tiktoken để đếm token (sử dụng encoding gần đúng theo gpt-3.5)
+    encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
+    return len(encoding.encode(text))
+
+def suggest_followups(answer: str) -> list[str]:
+    prompt = f"Dựa vào câu trả lời sau, hãy gợi ý 3 câu hỏi tiếp theo mà người dùng có thể hỏi:\n\n{answer}"
+    result = call_llm(prompt)
+    # Parse gợi ý dạng gạch đầu dòng
+    suggestions = [line.strip("-• ").strip() for line in result.strip().split("\n") if line.strip()]
+    return suggestions[:3]
+
+def build_prompt_with_history(current_query: str, chat_history: list[dict], max_turns: int = 3) -> str:
+    selected = chat_history[-max_turns:] if len(chat_history) >= max_turns else chat_history
+    prompt = "Dưới đây là lịch sử hội thoại trước đó:\n"
+    for i, h in enumerate(selected):
+        prompt += f"\n[Lượt {i+1}]\nQ: {h['query']}\nA: {h['answer']}\n"
+    prompt += f"\n[Lượt hiện tại]\nQ: {current_query}"
+    return prompt
+
+def is_editing_previous_query(query: str) -> bool:
+    return bool(re.search(r"sửa câu\\s*\\d+", query.lower()) or "nói lại" in query.lower())
+
+def _hash_prompt(prompt: str) -> str:
+    return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+def _cache_path(prompt: str) -> str:
+    return os.path.join(CACHE_DIR, _hash_prompt(prompt) + ".pkl")
+
+
+def call_llm(prompt: str, system_prompt: str = "Bạn là một trợ lý AI.", model="deepseek/deepseek-chat-v3-0324:free") -> str:
+    completion = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
+    )
+    return completion.choices[0].message.content.strip()
+
+def call_llm_cached(prompt: str, model="deepseek/deepseek-chat-v3-0324:free") -> str:
+    path = _cache_path(prompt)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    result = call_llm(prompt, model)
+    with open(path, "wb") as f:
+        pickle.dump(result, f)
+    return result
+
+===== ./rag_engine/embedding.py =====
+import os
+from openai import OpenAI
+from dotenv import load_dotenv
+import hashlib
+import pickle
+
+load_dotenv()
+
+COHERE_API_KEY = os.getenv("COHERE_API_KEY")
+MODEL_EMBEDDING = os.getenv("MODEL_EMBEDDING")
+
+CACHE_DIR = ".cache/embeddings"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+client = OpenAI(
+    base_url="https://api.cohere.ai/compatibility/v1",
+    api_key=COHERE_API_KEY,
+)
+
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    response = client.embeddings.create(
+        input=texts,
+        model=MODEL_EMBEDDING,
+        encoding_format="float",
+    )
+    return [d.embedding for d in response.data]
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+def _cache_path(text: str) -> str:
+    return os.path.join(CACHE_DIR, _hash_text(text) + ".pkl")
+
+def get_embedding(text: str, model=MODEL_EMBEDDING) -> list[float]:
+    response = client.embeddings.create(
+        input=[text],
+        model=model,
+    )
+    return response.data[0].embedding
+
+def get_embedding_cached(text: str, model=MODEL_EMBEDDING) -> list[float]:
+    path = _cache_path(text)
+    if os.path.exists(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    embedding = get_embedding(text, model)
+    with open(path, "wb") as f:
+        pickle.dump(embedding, f)
+    return embedding
+
+===== ./rag_engine/runner.py =====
+import os
+import subprocess
+
+def run_project(project_path: str) -> str:
+    """
+    Chạy file main.py trong thư mục project đã tạo.
+    Trả về stdout hoặc thông báo lỗi nếu có.
+    """
+    main_path = os.path.join(project_path, "main.py")
+    
+    if not os.path.exists(main_path):
+        raise FileNotFoundError(f"Không tìm thấy file main.py trong: {project_path}")
+    
+    try:
+        # Chạy file main.py và capture output
+        result = subprocess.run(
+            ["python", main_path],
+            cwd=project_path,
+            capture_output=True,
+            text=True,
+            timeout=30  # tránh infinite loop
+        )
+        
+        if result.returncode != 0:
+            return f"[ERROR] {result.stderr}"
+        
+        return result.stdout
+    
+    except subprocess.TimeoutExpired:
+        return "[ERROR] Quá thời gian chạy (timeout)."
+    except Exception as e:
+        return f"[ERROR] Lỗi khi chạy project: {str(e)}"
+
+
+===== DIRECTORY TREE =====
+./
+    test.py
+    llm_utils.py
+    LICENSE
+    app.py
+    .env
+    generated_projects/
+        project_20250717_115520/
+            main.py
+            config.yaml
+            utils/
+                helper.py
+    rag_engine/
+        __init__.py
+        file_parser.py
+        auto_builder.py
+        vector_store.py
+        project_builder.py
+        utils.py
+        reranker.py
+        llm.py
+        embedding.py
+        runner.py
+    _utils/
+    .cache/
+        embeddings/
+            234fff5d726d205d7273b4f2667dc765c1119556b5a999fd73a400f1102dfb5e.pkl
+        llm/
+            3871c5b0c2965113343d18dbbbbba93a40a913c8a33ffbd594cc7b1f26cceb8c.pkl
+            b1a575625c502b9022237303c33562a477260ba29c3a12f5b4c1f4eb43888e3c.pkl
+            bdc9ec7e9091fc8819c466ee88a46bfa4828dce5544462e950b788a575a2ba4e.pkl
+            e210cfafa497edd70d0c0348fde4adfdd654475b1172332b5319fc9fd48fde0e.pkl
+            3ab955c4397e2b8304cbe7de455fca6ab333ddb8755fffb5f2b0291cc5bb8527.pkl
+            957b0d9d7bfd65fa8e7eeff1b167239495e05aaffc6d379e4b2cb9c65f6986d0.pkl
+            5d2146133abbf9b0e861c5626eb7d2ce78af40c95bb80dd63b5498c8cdfd4877.pkl
+            e9acf42b0817a6d9c2949493577e81addf45eb9a6bedfdba5990a3c73bab6a76.pkl
