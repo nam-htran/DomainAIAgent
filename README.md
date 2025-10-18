@@ -59,7 +59,7 @@ The application follows a sophisticated pipeline to answer user queries:
 git clone https://github.com/nam-htran/DomainAIAgent
 cd DomainAIAgent
 ```
-3. Set up a Virtual Environment (Recommended)
+### 3. Set up a Virtual Environment (Recommended)
 #### For Unix/macOS
 ```
 python3 -m venv venv
@@ -123,11 +123,8 @@ Your browser will automatically open the UI.
 
 ### 4. Usage Guide
 Upload Documents – Use the sidebar uploader to select one or more PDF, DOCX, or TXT files.
-
 Process Files – Click “Process and Load” and wait for confirmation.
-
 Ask Questions – Type your question in the chat input.
-
 View Answer – The AI shows an answer, related sources, and follow-up suggestions.
 
 ### 5. Project Structure
