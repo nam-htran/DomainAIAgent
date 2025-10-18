@@ -56,8 +56,8 @@ The application follows a sophisticated pipeline to answer user queries:
 ### 2. Clone the Repository
 
 ```
-git clone <your-repo-url>
-cd <repository-folder>
+git clone https://github.com/nam-htran/DomainAIAgent
+cd DomainAIAgent
 ```
 3. Set up a Virtual Environment (Recommended)
 #### For Unix/macOS
