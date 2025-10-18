@@ -123,8 +123,11 @@ Your browser will automatically open the UI.
 
 ### 4. Usage Guide
 Upload Documents – Use the sidebar uploader to select one or more PDF, DOCX, or TXT files.
+
 Process Files – Click “Process and Load” and wait for confirmation.
+
 Ask Questions – Type your question in the chat input.
+
 View Answer – The AI shows an answer, related sources, and follow-up suggestions.
 
 ### 5. Project Structure
